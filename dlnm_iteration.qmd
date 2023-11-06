@@ -1,0 +1,487 @@
+---
+title: "dlnm_workflow_and_pmap_iteration"
+subtitle: "multi_parameter_df_selection_pmap_iteration" 
+author: "YISEN YANG"
+date: "2023-11-04"
+format:
+  html:
+    theme: litera
+    toc: true
+---
+
+**迭代无疑是进步的核心**
+
+**Iteration keeps undoubtedly at the heart of progress**
+
+**main object**
+
+-   dlnm workflow
+
+-   多参数组合, 怎么找出来最佳的一种: 4个自由度均为1:6, 共有6\^4 = 1296种组合, 哪种组合进去效果最好?
+
+-   同时多模型迭代
+
+# load packages and data
+
+```{r, warning=FALSE, message=FALSE}
+#|label: packages
+library(tidyverse)
+library(DataExplorer)
+library(AICcmodavg)
+library(lmtest)
+library(mgcv)
+library(Hmisc)
+library(GGally)
+library(dlnm)
+library(tsModel)
+library(splines)
+library(readr)
+```
+
+挑选目标变量
+
+```{r, warning=FALSE, message=FALSE}
+#|label: data
+data <- read_csv("D:/r4ds/TW/fh/data/dat_beijing_use.csv")
+data <- data |> 
+  dplyr::select(date, ## 日期ymd
+                PM2.5,  ## 主要污染物
+                all, hyp, copd,  ## 结局
+                no2, so2, pm10,  ## 其他污染物(要调整的)
+                time, temp, humd, ## 时间(`1:nrow(data)`), 温度, 相对湿度
+                dow) ## 星期几
+```
+
+# discription
+
+## time series plot
+
+```{r, dpi = 300}
+#|label: time series plot
+data_plot <- data |> 
+  select(date, PM2.5, pm10, so2, no2, temp) |> 
+  pivot_longer(
+    cols = c(PM2.5, pm10, so2, no2, temp),
+    names_to = "variable",
+    values_to = "value"
+  )
+data_plot |> 
+  ggplot(aes(date, value, color = variable))+
+  geom_point()+
+  facet_wrap( ~ variable, nc = 1, scales = "free")+
+  theme(legend.position = "none")
+```
+
+## corr
+
+```{r, message=FALSE, warning=FALSE, dpi = 300}
+#|label: corr
+data |> 
+  select(PM2.5, pm10, so2, no2, temp) |> 
+  ggpairs()
+```
+
+# model df selection
+
+model: log\[E(Y)\] = cb(AP, lag) + cb(temp, lag) + ns(rh, df1) + ns(time, df2) + $\nu$ Dow + $\alpha$
+
+在模型中, 我们需要确定滞后天数及自由度, 滞后天数我们可以根据经验或者目的, 以及已有文献报告, 看短期或长期效应来确定.
+
+本文主要提供了根据QAIC, QBIC筛选合适自由度(df1, df2......)
+
+当待定自由度比较多时候, 会组合出来很多模型, 这时候就需要迭代选出最佳df
+
+本文建立了**最优自由度组合筛选算法**, 拓展了**多参数迭代**的应用, 也为dlnm模型选df提供了算法实现思路
+
+## purpose
+
+以`PM2.5`为exposure, `all` 为outcome
+
+对so2, no2, pm10三种调整的污染物, time, 相对湿度的自由度(degree of freedom)进行调整
+
+time 自由度备选`7:9`(或者固定7), 污染物和温度自由度备选`1:6`
+
+```{r, warning=FALSE, message=FALSE}
+attach(data)
+```
+
+## cb of temp
+
+```{r, warning=FALSE, message=FALSE}
+#|label: cb temp
+temaxlag <- 21
+lkt <- logknots(temaxlag, 3)
+ctemp <- crossbasis(temp, lag = 21, 
+                    argvar = list(fun = "bs", knots = c(.10, .75, .90)), 
+                    arglag = list(knots = lkt))
+
+ctemp |> summary()
+```
+
+## cb of AP
+
+```{r}
+#|label: cb AP
+AP <- data$PM2.5
+apmaxlag <- 14
+lkp <- logknots(apmaxlag, 3)
+cAP <- crossbasis(AP, lag = 14,
+                  argvar = list(fun = "lin"),
+                  arglag = list(knots = lkp))
+```
+
+## outcome
+
+```{r}
+outcome <- data$all
+```
+
+## QIACBIC
+
+```{r}
+#|label: QIACBIC
+qaicbic <- function(model){
+  phi <- summary(model)$dispersion
+  logll <- sum(dpois(ceiling(model$y), lambda = exp(predict(model)), log = T))
+  cbind((-2*logll + 2*summary(model)$df[3]*phi),
+        (-2*logll + log(length(resid(model)))*phi*summary(model)$df[3]))
+}
+```
+
+## df_selection fun
+
+```{r}
+#|label: fun
+df_selection <- function(dn, ds, dp, dh, dt){
+    mod <- glm(outcome ~ ctemp 
+               + ns(no2, dn) + ns(so2, ds) + ns(pm10, dp)
+               + ns(time, dt*4) + ns(humd, dh)  
+               + factor(dow),
+           family = quasipoisson)
+    result <- cbind(qaicbic(mod), dn, ds, dp, dh, dt)
+    colnames(result) <- NULL
+    result
+}
+```
+
+测试一个
+
+```{r}
+df_selection(3, 3, 3, 3, 7)
+```
+
+## df_free_data
+
+然后我们要构建所有自由度组合(共有`6^4 = 1296`种组合)
+
+```{r}
+#|label: df data1
+df_free1 <- replicate(50000, sample(c(1:6), 4, replace = T)) |> 
+  as.matrix() |> 
+  t() |> 
+  as.data.frame()
+```
+
+从1:6里面又放回抽样抽4个(因为4个自由度1:6里面选), 这个时候只有一个, 但我们需要`6^4`种
+
+所有利用`replicate()`重复此操作50000次(原因稍后会讲)
+
+我们可以看一下10次的结果长啥样子
+
+```{r}
+#|label: replicate example
+replicate(10, sample(c(1:6), 4, replace = T)) |> t()
+```
+
+然后生成`7:9`的序列
+
+只有一列, 所以不需要转置
+
+```{r}
+#|label: df data2
+df_free2 <- replicate(50000, sample(c(7:9), 1, replace = T)) |>
+  as.matrix() |>
+  as.data.frame()
+```
+
+或者固定时间自由度为7
+
+```{r}
+#|label: df data3
+df_free3 <- c(rep(7, 5000)) |>
+  as.data.frame()
+```
+
+
+```{r}
+#|label: df data
+df_free <- cbind(df_free1, df_free3)
+colnames(df_free) <- c("dn", "ds", "dp", "dh", "dt")
+```
+
+这时候`df_free`是有很多重复的行的, 所以我们利用`distinct()`进行去除重复行
+
+剩下1296行完全不重复
+
+```{r}
+#|label: df data
+df_free <- df_free |> 
+  distinct() 
+nrow(df_free) ## 全部组合出来了6^4 = 1296种
+```
+
+为什么我们要重复抽样50000次: 为了去重之后有1296种不重复的组合, 如果不是足够多次数抽样的话, 可能不能够出现所有组合
+
+看组合结果的前10行
+
+```{r}
+#|label: df data
+df_free |> arrange(dt, dn, ds, dp, dh) |> head(10) |> knitr::kable()
+```
+
+## pmap
+
+然后我们通过pmap进行迭代
+
+`pmap`是`map`函数多参数的形态(加载`tidyverse`包时自动加载)
+
+pmap原理
+
+我们想同时生成三组不同样本量, 不同$\mu$, 不同$\sigma$ 的 正态分布模拟数据
+
+```{r}
+#|label: hwo pmap work 
+mu <- list(5, 10, -3)
+sigma <- list(1, 5, 10)
+n <- list(1, 3, 5)
+
+args <- list(mean = mu, sd = sigma, n = n)
+args |> 
+  pmap(rnorm) |> str()
+```
+
+或者**多参数以数据框形态呈现**
+
+*因为没有设随机种子, 所以两次结果不太一样*
+
+```{r}
+#|label: hwo pmap work 
+params <- tribble(
+  ~mean, ~sd, ~n,
+  5,     1,    1,
+  10,    5,    3, 
+  -3,    10,   5
+)
+params |> 
+  pmap(rnorm) |> str()
+```
+
+这里我们的df_free是数据框形态, 所以直接放进去, 然后传递给`result`, 我们后面要对其进行整理
+
+因为要迭代1296次, 需要几分钟(这个看电脑本身性能, 我的电脑需要1 mins)
+
+```{r}
+#|label: iteration
+result <- df_free |> 
+  pmap(df_selection)
+```
+
+然后我们需要将result整理成我们想要的格式
+
+`pmap`的结果是列表`list`, 我们需要将其转成data.frame
+
+这一步核心思想是把列表打开(`unlist()`变成一系列数), 然后转成矩阵同时指定列数(结果是qaic, qbic两个值以及5个自由度共7列, 所以我们指定`nc = 7`, 同时按行顺序填充`byrow = T`)
+
+**attention**: `matrix()`和`as.matrix()`可不一样, 前者才能够指定行数或列数
+
+```{r}
+#|label: iteration result
+result <- result |> unlist() |> matrix(nc = 7, byrow = T) |> as.data.frame()
+colnames(result) <- c("qaic", "qbic", "dn", "ds", "dp", "dh", "dt")
+```
+
+然后我们根据`qaic`, `qbic`, 以及`qaic + qbic`大小(当然这个没有什么意义, 纯粹是想看他俩加起来的大小)进行(从小到大)排序
+(当然直接相加有一个潜在的问题是, 视二者等权重)
+
+`qaic`, `qbic`是对`AIC`,`BIC`的拓展, `q`为`quasi`, 因为结局是死亡数, 符合Poisson distribution, 而实际中大都会方差`Var(y)`大于均值`E(y)`, 故拟合`Quasi-Poisson`
+
+简单来说
+
+-   `AIC` 是模型的预测误差(predict error)
+
+-   `BIC` 是对模型复杂度的惩罚(不让模型太复杂, 太复杂会overfitting)
+
+```{r}
+#|label: iteration result
+result |> arrange(qaic, qbic, dn, ds, dp, dh) |> head(10) |> knitr::kable()
+result |> arrange(qbic, qaic, dn, ds, dp, dh) |> head(10) |> knitr::kable()
+
+result |> 
+  mutate(qaicbic = qaic + qbic, .before = 1) |> 
+  arrange(qaicbic, dn, ds, dp, dh) |> head(10) |> knitr::kable()
+```
+
+有时候排名前10的qaic都很接近, qbic差的有点多, qbic最小的和其次小的对应的两个模型对应的qaic也差不多大, 我们可以选qbic最小的对应的模型参数.
+
+
+
+本例子我们取QAIC最小对应的12227五个自由度
+
+**至此, 自由度筛选的工作完成了**
+
+# dlnm model
+
+然后就是常规的dlnm的做法了
+
+## dlnm fun
+
+因为要替换不同的污染物和结局, 以及data, 所以直接写了个函数
+
+同时, 我们会有不同的模型(调整不同的污染物浓度), 所以再写一个函数进行`map`迭代
+
+实际中修改协变量或者`#`注释掉不需要的部分即可
+
+```{r}
+#|label: dlnm function
+yysfun_AP <- function(AP, outcome, data){
+  attach(data)
+  temaxlag <- 21
+  lkt <- logknots(temaxlag, 3)
+  ctemp <- crossbasis(temp, lag = 21, 
+                      argvar = list(fun = "bs", knots = c(.10, .75, .90)), 
+                      arglag = list(knots = lkt))
+  
+  apmaxlag <- 14
+  lkp <- logknots(apmaxlag, 3)
+  cAP <- crossbasis(AP, lag = 14,
+                    argvar = list(fun = "lin"),
+                    arglag = list(knots = lkp))
+ 
+  mod0 <- gam(outcome ~ cAP + ctemp 
+           #+ ns(no2, 1) + ns(so2, 2) + ns(pm10, 2)
+           + ns(time, 7*4) + ns(humd, 2)
+           + factor(dow),
+           family = quasipoisson)
+  mod1 <- gam(outcome ~ cAP + ctemp 
+           + ns(no2, 1) #+ ns(so2, 2) + ns(pm10, 2)
+           + ns(time, 7*4) + ns(humd, 2) 
+           + factor(dow),
+           family = quasipoisson)
+  mod2 <- gam(outcome ~ cAP + ctemp 
+           + ns(no2, 1) + ns(so2, 2) #+ ns(pm10, 2)
+           + ns(time, 7*4) + ns(humd, 2)
+           + factor(dow),
+           family = quasipoisson)
+  mod3 <- gam(outcome ~ cAP + ctemp 
+           + ns(no2, 1) + ns(so2, 2) + ns(pm10, 2)
+           + ns(time, 7*4) + ns(humd, 2)  
+           + factor(dow),
+           family = quasipoisson)
+  
+  mlist <- list(mod0, mod1, mod2, 
+                mod3)
+  
+  yysfun_plot <- function(mod){
+    predAP <- crosspred(cAP, mod, by = 1, cumul = T)
+    mat <- matrix(c(1, 1, 2, 3), 2, 2, byrow = T)
+    layout(mat)
+    plot(predAP, "overall", col = 2, cex.axis = 1.50,
+         ylab = "RR", # xlab = "PM2.5",
+         main = "Overall cumulative association for 14 lags",
+         cex.main = 0.8)
+    plot(predAP, "slices", var = 10, ci = "bars", ci.level = 0.95, type = "p", 
+        col = 2, pch = 19, ylab = "RR",
+        main = "Lag-response curve for a 10-unit increase in AP",
+        cex.main = 0.8)
+    plot(predAP, "slices", var = 10, col = 4, cumul = T, ylab = "Cumulative RR",
+         main = "Lag-response curve of incremental cumulative effect",
+         cex.main = 0.8)
+  }
+  
+  map(mlist, yysfun_plot)
+}
+```
+
+```{r, dpi = 300}
+#|label: test dlnm function
+yysfun_AP(PM2.5, copd, data)
+```
+
+结果三个图分别是总效应, 每个滞后天数的效应, 累积滞后效应
+
+这样我们可以筛哪些有意义(换不同的污染物和结局即可)
+
+## refit mdoel
+
+然后我们想要固定滞后天数看浓度的does-response或固定浓度看lag-response
+
+这个时候我们确定了模型, 需要肉眼(直接)看有意义的
+
+经验来说, 高浓度时候效应会更强; 对于此例, 我们看lag0和浓度P95
+
+### cb of temp
+
+```{r, warning=FALSE, message=FALSE}
+temaxlag <- 21
+lkt <- logknots(temaxlag, 3)
+ctemp <- crossbasis(temp, lag = 21, 
+                    argvar = list(fun = "bs", knots = c(.10, .75, .90)), 
+                    arglag = list(knots = lkt))
+
+ctemp |> summary()
+```
+
+### cb of AP
+
+```{r}
+AP <- data$PM2.5
+apmaxlag <- 14
+lkp <- logknots(apmaxlag, 3)
+cAP <- crossbasis(AP, lag = 14,
+                  argvar = list(fun = "lin"),
+                  arglag = list(knots = lkp))
+```
+
+```{r}
+outcome <- data$copd
+mod <- gam(outcome ~ cAP + ctemp 
+           + ns(no2, 1) + ns(so2, 2) + ns(pm10, 2)
+           + ns(time, 7*4) + ns(humd, 2)  
+           + factor(dow),
+           family = quasipoisson)
+
+predAP <- crosspred(cAP, mod, by = 1, cumul = T)
+```
+
+#### over all
+
+```{r, dpi = 300}
+plot(predAP, "overall", col = 2, cex.axis = 1.50,
+     xlab = "PM2.5", ylab = "RR",
+     main = "Overall cumulative association for 14 lags",
+     cex.main = 0.8)
+```
+
+#### lag response and cumu effect
+
+```{r, dpi = 300}
+par(mfrow = c(1, 2))
+plot(predAP, "slices", var = 10, ci = "bars", ci.level = 0.95, type = "p", 
+     col = 2, pch = 19, ylab = "RR",
+     main = "Lag-response curve for a 10-unit increase in PM2.5",
+     cex.main = 0.8)
+
+plot(predAP, "slices", var = 10, col = 4, cumul = T, ylab = "Cumulative RR",
+     main = "Lag-response curve of incremental cumulative effect",
+     cex.main = 0.8)
+```
+
+#### fixed lag and exposure value
+
+```{r, dpi = 300}
+p95 <- quantile(AP, 0.95)%>% as.numeric() %>% round(0)
+
+plot(predAP, "slices", var = c(p95), lag = c(0), col = 4,
+     ci.level = 0.95,
+     ci.arg = list(density = 40, col = grey(0.7)))
+```
