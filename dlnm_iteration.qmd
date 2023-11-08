@@ -42,7 +42,7 @@ library(readr)
 
 ```{r, warning=FALSE, message=FALSE}
 #|label: data
-data <- read_csv("D:/r4ds/TW/fh/data/dat_beijing_use.csv")
+data <- read_csv("D:/r4ds/dlnm/data/dat_beijing_use.csv")
 data <- data |> 
   dplyr::select(date, ## 日期ymd
                 PM2.5,  ## 主要污染物
